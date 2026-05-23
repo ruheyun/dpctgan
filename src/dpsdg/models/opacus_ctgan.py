@@ -14,7 +14,7 @@ from opacus import PrivacyEngine
 
 from dpsdg.data.dp_data_transformer import DPDataTransformer
 
-class DPCTGAN(CTGAN):
+class OPCTGAN(CTGAN):
     def __init__(
         self,
         log_frequency=False,
