@@ -19,16 +19,13 @@ class OpacusCTGAN(CTGAN):
         epsilon=None,
         delta=1e-5,
         max_grad_norm=1.0,
-        use_gradient_penalty=False,
         **kwargs
     ):
         """Create a DP-CTGAN synthesizer."""
-        super().__init__(pac=1, **kwargs)
+        super().__init__(log_frequency=True, pac=1, **kwargs)
         self.max_grad_norm = max_grad_norm
         self.epsilon = epsilon
         self.delta = delta
-        self.use_gradient_penalty = use_gradient_penalty
-        self.gp_lambda_ = 10
 
     @random_state
     def fit_transformer(self, data, discrete_columns):
@@ -92,6 +89,8 @@ class OpacusCTGAN(CTGAN):
             weight_decay=self._discriminator_decay,
         )
 
+        #_discriminator = discriminator
+
         privacy_engine = PrivacyEngine()
         privacy_args = {
             'module': discriminator,
@@ -119,15 +118,12 @@ class OpacusCTGAN(CTGAN):
             description = 'Gen. ({gen:.2f}) | Discrim. ({dis:.2f})'
             epoch_iterator.set_description(description.format(gen=0, dis=0))
 
-        steps_per_epoch = max(len(train_data) // self._batch_size, 1)
         for i in epoch_iterator:
-            #for batch_data in data_loader:
-            #    batch_size = batch_data[0].shape[0]
-            for id_ in range(steps_per_epoch):
-                batch_size = self._batch_size
+            for batch_data in data_loader:
+                batch_size = batch_data[0].shape[0]
 
                 # Discriminator
-                c1, m1, col, opt = self._data_sampler.sample_condvec(batch_size)
+                c1, _, _, _ = self._data_sampler.sample_condvec(batch_size)
                 c1 = torch.from_numpy(c1).to(self._device)
 
                 fakez = torch.normal(mean=mean, std=std, generator=noise_gen)
@@ -136,8 +132,7 @@ class OpacusCTGAN(CTGAN):
                 fakeact = self._apply_activate(fake)
                 fake_cat = torch.cat([fakeact, c1], dim=1)
 
-                real_data = self._data_sampler.sample_data(train_data, batch_size, col, opt)
-                real_data = torch.from_numpy(real_data.astype('float32')).to(self._device)
+                real_data = batch_data[0].to(self._device)
                 real_cat = torch.cat([real_data, c1], dim=1)
 
                 optimizerD.zero_grad(set_to_none=False)
@@ -145,35 +140,17 @@ class OpacusCTGAN(CTGAN):
                 y_real = discriminator(real_cat)
                 loss_fake = torch.mean(y_fake)
                 loss_real = -torch.mean(y_real)
+                #pen = _discriminator.calc_gradient_penalty(real_cat, fake_cat, self._device, self.pac)
                 loss_d = (loss_fake + loss_real) / 2
-                if self.use_gradient_penalty:
-                    alpha = torch.rand(real_cat.size(0), 1, device=self._device)
-                    alpha = alpha.repeat(1, real_cat.size(1))
-                    interpolates = alpha * real_cat + ((1 - alpha) * fake_cat)
-                    disc_interpolates = discriminator(interpolates)
-
-                    gradients = torch.autograd.grad(
-                        outputs=disc_interpolates,
-                        inputs=interpolates,
-                        grad_outputs=torch.ones(disc_interpolates.size(), device=self._device),
-                        create_graph=True,
-                        retain_graph=True,
-                        only_inputs=True,
-                    )[0]
-
-                    gradients_view = gradients.view(-1, real_cat.size(1)).norm(2, dim=1) - 1
-                    gradient_penalty = ((gradients_view) ** 2 * self.gp_lambda_).mean()
-
-                    # XXX This doesn't actually work... can't autograd across the autograd?
-                    loss_d += gradient_penalty
                 loss_d.backward()
 
                 optimizerD.step()
                 total_norm = torch.cat([p.grad.flatten() for p in discriminator.parameters()]).norm(2).item()
+                #print(i, loss_fake.item(), loss_real.item(), total_norm)
 
                 # Generator
                 fakez = torch.normal(mean=mean, std=std, generator=noise_gen)
-                c1, m1, col, opt = self._data_sampler.sample_condvec(batch_size)
+                c1, m1, col, opt = self._data_sampler.sample_condvec(self._batch_size)
 
                 c1 = torch.from_numpy(c1).to(self._device)
                 m1 = torch.from_numpy(m1).to(self._device)
