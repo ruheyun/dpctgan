@@ -11,7 +11,7 @@ from ctgan.synthesizers.base import random_state
 from ctgan.synthesizers.ctgan import CTGAN, Discriminator, Generator
 from opacus import PrivacyEngine
 from torch.utils.data import DataLoader, TensorDataset
-from dpsgd.data.dp_data_transformer import DPDataTransformer
+from dpsdg.data.dp_data_transformer import DPDataTransformer
 
 class OpacusCTGAN(CTGAN):
     def __init__(
