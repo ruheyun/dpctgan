@@ -53,9 +53,9 @@ synthetic_data = ctgan.sample(1000)
 **DP-CTGAN** (with differential privacy):
 
 ```python
-from dpsdg.models.dp_ctgan import DPDPCTGAN
+from dpsdg.models.dp_ctgan import DPCTGAN
 
-model = DPDPCTGAN(epsilon=1.0, delta=1e-5, epochs=300)
+model = DPCTGAN(epsilon=1.0, delta=1e-5, epochs=300)
 model.fit_transformer(real_data, discrete_columns)  # must be called before fit
 model.fit(real_data, discrete_columns)
 synthetic_data = model.sample(1000)
