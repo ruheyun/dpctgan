@@ -3,138 +3,97 @@ import warnings
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
-
 from tqdm import tqdm
-from torch.utils.data import DataLoader, TensorDataset
-
 from ctgan.data_sampler import DataSampler
+from ctgan.data_transformer import DataTransformer
 from ctgan.synthesizers.base import random_state
-from ctgan.synthesizers.ctgan import (
-    CTGAN,
-    Discriminator,
-    Generator,
-)
-
+from ctgan.synthesizers.ctgan import CTGAN, Discriminator, Generator
+from torch.utils.data import DataLoader, TensorDataset
+import opacus
 from opacus import PrivacyEngine
 
 from dpsdg.data.dp_data_transformer import DPDataTransformer
 
-
-class DPDiscriminator(Discriminator):
-
-    def forward(self, input_):
-        assert input_.size()[0] % self.pac == 0
-
-        # REMOVE SIGMOID
-        # IMPORTANT for BCEWithLogitsLoss / WGAN stability
-        return self.seq(input_.view(-1, self.pacdim))
-
-
-class OpacusCTGAN(CTGAN):
-
+class DPCTGAN(CTGAN):
     def __init__(
         self,
-        epsilon=1.0,
+        log_frequency=False,
+        epsilon=0.0,
         delta=1e-5,
         max_grad_norm=1.0,
-        **kwargs,
+        use_gradient_penalty=False,  # 推荐在 DP 下关闭 GP
+        gp_lambda=0,                 # 设为 0
+        **kwargs
     ):
-
-        super().__init__(pac=1, **kwargs)
-
+        """Create a DP-CTGAN synthesizer."""
+        super().__init__(
+            pac=1,
+            log_frequency=log_frequency,
+            **kwargs
+        )
         self.epsilon = epsilon
         self.delta = delta
         self.max_grad_norm = max_grad_norm
+        self.gp_lambda = gp_lambda
 
     @random_state
-    def fit_transformer(self, full_data, discrete_columns):
-
-        self._validate_discrete_columns(
-            full_data,
-            discrete_columns
-        )
-
-        self._validate_null_data(
-            full_data,
-            discrete_columns
-        )
+    def fit_transformer(self, data, discrete_columns):
+        self._validate_discrete_columns(data, discrete_columns)
+        self._validate_null_data(data, discrete_columns)
 
         self._transformer = DPDataTransformer()
+        self._transformer.fit(data, discrete_columns)
 
-        self._transformer.fit(
-            full_data,
-            discrete_columns
+        transformed_data = self._transformer.transform(data)
+        self._data_sampler = DataSampler(
+            transformed_data, self._transformer.output_info_list, self._log_frequency
         )
 
     @random_state
-    def fit(
-        self,
-        train_data,
-        discrete_columns=(),
-        epochs=None
-    ):
+    def sample(self, num_rows):
+        """Sample data similar to the training data."""
+        return super().sample(n=num_rows)
 
-        self._validate_discrete_columns(
-            train_data,
-            discrete_columns
-        )
+    @random_state
+    def condvec_from_real(self, real_data):
+        batch = len(real_data)
 
-        self._validate_null_data(
-            train_data,
-            discrete_columns
-        )
+        discrete_column_id = np.random.choice(self._data_sampler._n_discrete_columns, batch)
+        mask = np.zeros((batch, self._data_sampler._n_discrete_columns), dtype='float32')
+        mask[np.arange(batch), discrete_column_id] = 1
 
-        if epochs is None:
-            epochs = self._epochs
+        category_id_in_col = real_data[np.arange(batch), discrete_column_id].astype("int")
+        category_id = self._data_sampler._discrete_column_cond_st[discrete_column_id] + category_id_in_col
 
-        if self._transformer is None:
+        cond = np.zeros((batch, self._data_sampler._n_categories), dtype='float32')
+        cond[np.arange(batch), category_id] = 1
 
-            warnings.warn(
-                "Transformer was not preconstructed--likely privacy leak.",
-                UserWarning,
-            )
+        return cond, mask, discrete_column_id, category_id_in_col
 
-            self.fit_transformer(
-                train_data,
-                discrete_columns
-            )
+    @random_state
+    def fit(self, train_data, discrete_columns=()):
+        """Fit the CTGAN Synthesizer models to the training data."""
+        random_seeds = torch.empty(2, dtype=int).random_()
+        loader_gen = torch.Generator()
+        loader_gen.manual_seed(random_seeds[0].item())
+        noise_gen = torch.Generator(device=self._device)
+        noise_gen.manual_seed(random_seeds[1].item())
 
-        transformed_data = self._transformer.transform(train_data)
-
-        dataset = TensorDataset(
-            torch.from_numpy(
-                transformed_data.astype("float32")
-            )
-        )
-
+        train_data = self._transformer.transform(train_data)
         data_loader = DataLoader(
-            dataset,
-            batch_size=self._batch_size,
-            shuffle=True,
-            drop_last=True,
-        )
-
-        self._data_sampler = DataSampler(
-            transformed_data,
-            self._transformer.output_info_list,
-            self._log_frequency,
+            TensorDataset(torch.from_numpy(train_data.astype("float32"))),
+            batch_size=self._batch_size, shuffle=True, drop_last=False,
+            generator=loader_gen
         )
 
         data_dim = self._transformer.output_dimensions
 
         self._generator = Generator(
-            self._embedding_dim
-            + self._data_sampler.dim_cond_vec(),
-            self._generator_dim,
-            data_dim,
+            self._embedding_dim + self._data_sampler.dim_cond_vec(), self._generator_dim, data_dim
         ).to(self._device)
 
-        discriminator = DPDiscriminator(
-            data_dim
-            + self._data_sampler.dim_cond_vec(),
-            self._discriminator_dim,
-            pac=self.pac,
+        discriminator = Discriminator(
+            data_dim + self._data_sampler.dim_cond_vec(), self._discriminator_dim, pac=self.pac
         ).to(self._device)
 
         optimizerG = torch.optim.Adam(
@@ -151,214 +110,105 @@ class OpacusCTGAN(CTGAN):
             weight_decay=self._discriminator_decay,
         )
 
-        # ==========================================================
-        # OPACUS
-        # ==========================================================
+        is_dp_enabled = self.epsilon > 0
 
-        privacy_engine = PrivacyEngine()
-
-        discriminator, optimizerD, data_loader = (
-            privacy_engine.make_private_with_epsilon(
+        if is_dp_enabled:
+            privacy_engine = PrivacyEngine()
+            
+            # 使用 Opacus 标准包装。注意：因为移除了 GP 的额外 autograd，这里不需要任何多余的 context
+            discriminator, optimizerD, data_loader = privacy_engine.make_private_with_epsilon(
                 module=discriminator,
                 optimizer=optimizerD,
                 data_loader=data_loader,
                 target_epsilon=self.epsilon,
                 target_delta=self.delta,
-                epochs=epochs,
+                epochs=self._epochs,
                 max_grad_norm=self.max_grad_norm,
-                poisson_sampling=False,
             )
-        )
+            print(f"Opacus configured with noise multiplier: {optimizerD.noise_multiplier}")
 
-        # ==========================================================
+        self.loss_values = pd.DataFrame(columns=['Epoch', 'Generator Loss', 'Discriminator Loss'])
 
-        epoch_iterator = tqdm(
-            range(epochs),
-            disable=(not self._verbose)
-        )
-
+        epoch_iterator = tqdm(range(self._epochs), disable=(not self._verbose))
         if self._verbose:
-
-            description = (
-                'Gen. ({gen:.2f}) | '
-                'Discrim. ({dis:.2f})'
-            )
-
-            epoch_iterator.set_description(
-                description.format(
-                    gen=0,
-                    dis=0
-                )
-            )
-
-        loss_values = []
+            description = 'Gen. ({gen:.2f}) | Discrim. ({dis:.2f})'
+            epoch_iterator.set_description(description.format(gen=0, dis=0))
 
         for i in epoch_iterator:
-
             for batch_data in data_loader:
-
-                batch_size = batch_data[0].shape[0]
-
+                current_batch_size = batch_data[0].shape[0]
                 real_data = batch_data[0].to(self._device)
 
-                # ==================================================
-                # DISCRIMINATOR
-                # ==================================================
+                # ==========================================
+                # 1. 训练判别器 (Discriminator)
+                # ==========================================
+                optimizerD.zero_grad(set_to_none=True)
 
-                optimizerD.zero_grad()
-
-                fakez = torch.randn(
-                    batch_size,
-                    self._embedding_dim,
-                    device=self._device,
-                )
-
-                condvec = self._data_sampler.sample_condvec(
-                    batch_size
-                )
-
-                c1, m1, col, opt = condvec
-
+                c1, m1, col, opt = self.condvec_from_real(real_data.cpu().numpy())
                 c1 = torch.from_numpy(c1).to(self._device)
+                real_cat = torch.cat([real_data, c1], dim=1)
 
-                fakez = torch.cat(
-                    [fakez, c1],
-                    dim=1
-                )
-
-                fake = self._generator(fakez)
-
+                mean = torch.zeros(current_batch_size, self._embedding_dim, device=self._device)
+                fakez = torch.normal(mean=mean, std=mean+1, generator=noise_gen)
+                fakez = torch.cat([fakez, c1], dim=1)
+                
+                fake = self._generator(fakez).detach()
                 fakeact = self._apply_activate(fake)
-
-                fake_cat = torch.cat(
-                    [fakeact, c1],
-                    dim=1
-                )
-
-                c2 = c1[
-                    np.random.permutation(batch_size)
-                ]
-
-                real_cat = torch.cat(
-                    [real_data, c2],
-                    dim=1
-                )
+                fake_cat = torch.cat([fakeact, c1], dim=1)
 
                 y_fake = discriminator(fake_cat)
                 y_real = discriminator(real_cat)
 
-                # BCEWithLogitsLoss
-                loss_real = F.binary_cross_entropy_with_logits(
-                    y_real,
-                    torch.ones_like(y_real),
-                )
-
-                loss_fake = F.binary_cross_entropy_with_logits(
-                    y_fake,
-                    torch.zeros_like(y_fake),
-                )
-
-                loss_d = (
-                    loss_real + loss_fake
-                ) / 2
+                # 标准 WGAN 判别器损失：Opacus 会在这里非常完美地自动处理单个样本的梯度裁剪与加噪
+                loss_d = y_fake.mean() - y_real.mean()
 
                 loss_d.backward()
-
                 optimizerD.step()
 
-                # ==================================================
-                # GENERATOR
-                # ==================================================
+                # 获取当前判别器的梯度范数
+                raw_discriminator = discriminator._module if is_dp_enabled else discriminator
+                total_norm = torch.cat([p.grad.flatten() for p in raw_discriminator.parameters() if p.grad is not None]).norm(2).item()
 
-                optimizerG.zero_grad()
+                # ==========================================
+                # 2. 训练生成器 (Generator)
+                # ==========================================
+                optimizerG.zero_grad(set_to_none=True)
 
-                fakez = torch.randn(
-                    batch_size,
-                    self._embedding_dim,
-                    device=self._device,
-                )
-
-                condvec = self._data_sampler.sample_condvec(
-                    batch_size
-                )
-
-                c1, m1, col, opt = condvec
-
+                c1, m1, col, opt = self._data_sampler.sample_condvec(current_batch_size)
                 c1 = torch.from_numpy(c1).to(self._device)
-
                 m1 = torch.from_numpy(m1).to(self._device)
 
-                fakez = torch.cat(
-                    [fakez, c1],
-                    dim=1
-                )
-
+                mean = torch.zeros(current_batch_size, self._embedding_dim, device=self._device)
+                fakez = torch.normal(mean=mean, std=mean+1, generator=noise_gen)
+                fakez = torch.cat([fakez, c1], dim=1)
                 fake = self._generator(fakez)
-
                 fakeact = self._apply_activate(fake)
+                fake_cat = torch.cat([fakeact, c1], dim=1)
+                
+                y_fake = discriminator(fake_cat)
+                cross_entropy = self._cond_loss(fake, c1, m1)
 
-                y_fake = discriminator(
-                    torch.cat(
-                        [fakeact, c1],
-                        dim=1
-                    )
-                )
-
-                cross_entropy = self._cond_loss(
-                    fake,
-                    c1,
-                    m1
-                )
-
-                loss_g = (
-                    F.binary_cross_entropy_with_logits(
-                        y_fake,
-                        torch.ones_like(y_fake),
-                    )
-                    + cross_entropy
-                )
+                loss_g = -torch.mean(y_fake) + cross_entropy
 
                 loss_g.backward()
-
                 optimizerG.step()
 
-                generator_loss = (
-                    loss_g.detach()
-                    .cpu()
-                    .item()
+            generator_loss = loss_g.detach().cpu().item()
+            discriminator_loss = loss_d.detach().cpu().item()
+
+            epoch_loss_df = pd.DataFrame({
+                'Epoch': [i],
+                'Generator Loss': [generator_loss],
+                'Discriminator Loss': [discriminator_loss],
+                'Discriminator Grad Norm': [total_norm],
+            })
+            
+            if not self.loss_values.empty:
+                self.loss_values = pd.concat([self.loss_values, epoch_loss_df]).reset_index(drop=True)
+            else:
+                self.loss_values = epoch_loss_df
+
+            if self._verbose:
+                epoch_iterator.set_description(
+                    description.format(gen=generator_loss, dis=discriminator_loss)
                 )
-
-                discriminator_loss = (
-                    loss_d.detach()
-                    .cpu()
-                    .item()
-                )
-
-                loss_values.append([
-                    i,
-                    generator_loss,
-                    discriminator_loss
-                ])
-
-                if self._verbose:
-
-                    epoch_iterator.set_description(
-                        description.format(
-                            gen=generator_loss,
-                            dis=discriminator_loss,
-                        )
-                    )
-
-        self.loss_values = pd.DataFrame(
-            loss_values,
-            columns=[
-                'Epoch',
-                'Generator Loss',
-                'Discriminator Loss'
-            ]
-        )
-
-    @random_state
-    def sample(self, num_rows):
-
-        return super().sample(n=num_rows)
