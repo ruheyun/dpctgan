@@ -1,3 +1,3 @@
-from .models import DPCTGAN, DPTVAE
+from .models import DPCTGAN, DPTVAE, OPCTGAN
 
-__all__ = ['DPCTGAN', 'DPTVAE']
+__all__ = ['DPCTGAN', 'DPTVAE', 'OPCTGAN']
