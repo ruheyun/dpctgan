@@ -17,7 +17,7 @@ from opacus.utils.batch_memory_manager import BatchMemoryManager
 from dpsdg.data.dp_data_transformer import DPDataTransformer
 
 
-class DPTVAE(TVAE):
+class OPTVAE(TVAE):
     """A TVAE synthesizer using Opacus DP-SGD."""
 
     def __init__(
